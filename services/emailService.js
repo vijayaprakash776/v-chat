@@ -18,7 +18,7 @@ async function sendBrevoInvitationEmail({ toEmail, inviterName, companyName, acc
   }
 
   const senderEmail = process.env.BREVO_SENDER_EMAIL || 'abhiikumar1330@gmail.com';
-  const senderName = process.env.BREVO_SENDER_NAME || 'ChatApp Workspace';
+  const senderName = process.env.BREVO_SENDER_NAME || 'V Chat Workspace';
 
   const expiryString = expiresAt
     ? new Date(expiresAt).toLocaleDateString(undefined, {
@@ -159,14 +159,14 @@ async function sendBrevoInvitationEmail({ toEmail, inviterName, companyName, acc
 <body>
   <div class="email-container">
     <div class="email-header">
-      <h1 class="brand-title">ChatApp Workspace</h1>
+      <h1 class="brand-title">V Chat Workspace</h1>
       <p class="brand-tagline">Team Collaboration & Communication Platform</p>
     </div>
 
     <div class="email-body">
       <h2 class="greeting">You're invited!</h2>
       <p class="lead-text">
-        <strong>${inviterName}</strong> has invited you to join the <strong>${companyName}</strong> team workspace on ChatApp.
+        <strong>${inviterName}</strong> has invited you to join the <strong>${companyName}</strong> team workspace on V Chat.
       </p>
 
       <div class="details-card">
@@ -223,7 +223,7 @@ async function sendBrevoInvitationEmail({ toEmail, inviterName, companyName, acc
         email: toEmail,
       },
     ],
-    subject: `You've been invited to join ${companyName} on ChatApp`,
+    subject: `You've been invited to join ${companyName} on V Chat`,
     htmlContent,
   };
 
