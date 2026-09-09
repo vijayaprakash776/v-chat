@@ -31,6 +31,7 @@ const notificationSchema = new mongoose.Schema(
         'company_request',
         'company_approved',
         'company_rejected',
+        'reminder_due',
       ],
       required: true,
     },
@@ -57,6 +58,11 @@ const notificationSchema = new mongoose.Schema(
     todoId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Todo',
+      default: null,
+    },
+    reminderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Reminder',
       default: null,
     },
     isRead: {

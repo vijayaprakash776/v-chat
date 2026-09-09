@@ -99,13 +99,13 @@ const notifyDirectMessage = async ({
 
     if (!conversation) return [];
 
-    let participantIds = (conversation.participants || []).map((p) => (p._id || p).toString());
+    let participantIds = (conversation.participants || []).map((p) => (p._id || p.id || p).toString());
     if (participantIds.length === 0 && receiverId) {
       participantIds.push(receiverId.toString());
     }
 
-    // Exclude the sender
-    let recipientIds = participantIds.filter((id) => id !== senderId);
+    // Exclude the sender and deduplicate to prevent duplicate notifications
+    let recipientIds = Array.from(new Set(participantIds.filter((id) => id !== senderId)));
     if (recipientIds.length === 0) return [];
 
     // Verify recipients belong to active organization
@@ -224,10 +224,10 @@ const notifyChannelMessage = async ({
     if (!channelDoc) return [];
 
     const channelName = channelDoc.name || 'channel';
-    let memberIds = (channelDoc.members || []).map((m) => (m._id || m).toString());
+    let memberIds = (channelDoc.members || []).map((m) => (m._id || m.id || m).toString());
 
-    // Exclude sender
-    let recipientIds = memberIds.filter((id) => id !== senderId);
+    // Exclude sender and deduplicate to prevent duplicate notifications for @all and channel messages
+    let recipientIds = Array.from(new Set(memberIds.filter((id) => id !== senderId)));
     if (recipientIds.length === 0) return [];
 
     // Organization boundary: ensure recipients belong to channel's active organization

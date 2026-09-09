@@ -28,6 +28,16 @@ const channelSchema = new mongoose.Schema(
         ref: 'User',
       },
     ],
+    admins: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
+    ],
+    isAdminOnly: {
+      type: Boolean,
+      default: false,
+    },
     memberSettings: [
       {
         _id: false,

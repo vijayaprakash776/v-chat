@@ -97,7 +97,7 @@ const messageSchema = new mongoose.Schema(
     },
     messageType: {
       type: String,
-      enum: ['text', 'image', 'video', 'file', 'poll'],
+      enum: ['text', 'image', 'video', 'file', 'poll', 'call'],
       default: 'text',
     },
     attachments: {
@@ -106,6 +106,28 @@ const messageSchema = new mongoose.Schema(
     },
     poll: {
       type: pollSchema,
+      default: null,
+    },
+    call: {
+      type: new mongoose.Schema(
+        {
+          callType: {
+            type: String,
+            enum: ['audio', 'video'],
+            default: 'audio',
+          },
+          status: {
+            type: String,
+            enum: ['ended', 'missed', 'declined', 'cancelled'],
+            default: 'ended',
+          },
+          duration: {
+            type: Number,
+            default: 0,
+          },
+        },
+        { _id: false }
+      ),
       default: null,
     },
     isRead: {
@@ -212,11 +234,12 @@ messageSchema.pre('validate', function () {
   const hasContent = this.content && this.content.trim().length > 0;
   const hasAttachments = this.attachments && this.attachments.length > 0;
   const hasPoll = Boolean(this.poll && this.poll.question);
+  const hasCall = Boolean(this.call && this.call.callType) || this.messageType === 'call';
 
-  if (!hasContent && !hasAttachments && !hasPoll) {
+  if (!hasContent && !hasAttachments && !hasPoll && !hasCall) {
     this.invalidate(
       'content',
-      'Message must contain text content, at least one attachment, or a poll'
+      'Message must contain text content, at least one attachment, a poll, or a call entry'
     );
   }
 });

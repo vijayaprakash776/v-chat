@@ -61,15 +61,12 @@ const markMessageAsRead = async (req, res) => {
     // Real-Time Socket.IO event emission for read receipt & notification sync
     const io = req.app.get('io');
     if (io) {
-      if (message.conversationId) {
-        io.to(`conversation:${message.conversationId.toString()}`)
-          .to(`user:${message.sender.toString()}`)
-          .emit('message:read', {
-            messageId: message._id,
-            conversationId: message.conversationId,
-            readBy: userId,
-          });
-      }
+      const rooms = [`conversation:${message.conversationId.toString()}`, `user:${message.sender.toString()}`];
+      io.to(rooms).emit('message:read', {
+        messageId: message._id,
+        conversationId: message.conversationId,
+        readBy: userId,
+      });
     }
 
     return res.status(200).json({
@@ -540,7 +537,8 @@ const forwardMessage = async (req, res) => {
         });
       }
 
-      const receiverId = destConv.participants.find((p) => p.toString() !== userId);
+      const receiverId = destConv.participants.find((p) => p.toString() !== userId) || userId;
+      const isSelf = receiverId.toString() === userId.toString();
 
       if (destConv.organization && destConv.organization.toString() !== req.user.currentOrganizationId) {
         return res.status(403).json({
@@ -559,7 +557,7 @@ const forwardMessage = async (req, res) => {
         attachments: sourceMessage.attachments || [],
         forwarded: true,
         forwardedFrom: sourceMessage._id,
-        isRead: false,
+        isRead: isSelf ? true : false,
       });
 
       destConv.lastMessage = newMessageDoc._id;
@@ -575,14 +573,14 @@ const forwardMessage = async (req, res) => {
         });
 
       if (io) {
-        const convEmitter = io.to(`conversation:${destConv._id.toString()}`);
+        const rooms = [`conversation:${destConv._id.toString()}`];
         for (const p of destConv.participants || []) {
           const pid = (p._id || p).toString();
           if (pid !== userId) {
-            convEmitter.to(`user:${pid}`);
+            rooms.push(`user:${pid}`);
           }
         }
-        convEmitter.emit('message:new', { message: populated });
+        io.to(rooms).emit('message:new', { message: populated });
 
         await notifyDirectMessage({
           sender: populated.sender,

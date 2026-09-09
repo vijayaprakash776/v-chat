@@ -88,8 +88,15 @@ const organizationSchema = new mongoose.Schema(
   },
   {
     timestamps: true,
+    toObject: { virtuals: true },
+    toJSON: { virtuals: true },
   }
 );
+
+// Virtual getter for plan
+organizationSchema.virtual('plan').get(function () {
+  return this.subscription?.plan || 'free';
+});
 
 // Auto-generate slug from name if not provided
 organizationSchema.pre('save', function () {

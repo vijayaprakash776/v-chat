@@ -498,105 +498,6 @@ const updateFeatures = async (req, res) => {
   }
 };
 
-// =========================================================================
-// 6. USER MANAGEMENT
-// =========================================================================
-
-// @desc    List all users (paginated, searchable)
-// @route   GET /api/super-admin/users
-// @access  Super Admin only
-const getAllUsers = async (req, res) => {
-  try {
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
-    const skip = (page - 1) * limit;
-    const search = req.query.search ? req.query.search.trim() : '';
-    const roleFilter = req.query.role;
-
-    const query = { role: { $ne: 'super_admin' } }; // Hide other super admins for now
-    if (search) {
-      query.$or = [
-        { name: new RegExp(escapeRegex(search), 'i') },
-        { email: new RegExp(escapeRegex(search), 'i') },
-      ];
-    }
-    if (roleFilter && ['user', 'admin'].includes(roleFilter)) {
-      query.role = roleFilter;
-    }
-
-    const [users, total] = await Promise.all([
-      User.find(query)
-        .select('name email role status avatar currentOrganization createdAt lastSeenAt')
-        .populate('currentOrganization', 'name slug')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      User.countDocuments(query),
-    ]);
-
-    // Enrich with membership count
-    const enriched = await Promise.all(
-      users.map(async (user) => {
-        const orgCount = await Membership.countDocuments({ user: user._id });
-        return { ...user, orgCount };
-      })
-    );
-
-    return res.status(200).json({
-      success: true,
-      users: enriched,
-      pagination: {
-        total,
-        page,
-        limit,
-        pages: Math.ceil(total / limit),
-      },
-    });
-  } catch (err) {
-    console.error('getAllUsers error:', err.message);
-    return res.status(500).json({ success: false, message: 'Server error fetching users' });
-  }
-};
-
-// @desc    Update a user's status or role
-// @route   PATCH /api/super-admin/users/:id
-// @access  Super Admin only
-const updatePlatformUser = async (req, res) => {
-  try {
-    const { status, role } = req.body;
-    const updateData = {};
-
-    if (status && ['active', 'inactive'].includes(status)) {
-      updateData.status = status;
-    }
-    if (role && ['user', 'admin'].includes(role)) {
-      updateData.role = role;
-    }
-
-    if (Object.keys(updateData).length === 0) {
-      return res.status(400).json({ success: false, message: 'No valid update fields provided' });
-    }
-
-    const user = await User.findByIdAndUpdate(req.params.id, updateData, { new: true })
-      .select('-password')
-      .lean();
-
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: `User ${user.name} updated successfully.`,
-      user,
-    });
-  } catch (err) {
-    console.error('updatePlatformUser error:', err.message);
-    return res.status(500).json({ success: false, message: 'Server error updating user' });
-  }
-};
-
 module.exports = {
   getPlatformStats,
   getAllOrganizations,
@@ -606,6 +507,4 @@ module.exports = {
   suspendOrganization,
   updateSubscription,
   updateFeatures,
-  getAllUsers,
-  updatePlatformUser,
 };

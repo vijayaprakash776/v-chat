@@ -180,7 +180,6 @@ const registerUser = async (req, res) => {
 const loginUser = async (req, res) => {
   try {
     const { email, password, invitationToken } = req.body;
-    console.log(`[Login Attempt] Email: ${email}`);
 
     // 1. Validate input fields
     if (!email || !password) {
@@ -194,19 +193,18 @@ const loginUser = async (req, res) => {
     // 2. Check if user exists in database
     const user = await User.findOne({ email: normalizedEmail });
     if (!user) {
-      console.log(`[Login Failed] User not found: ${normalizedEmail}`);
       return res.status(401).json({
-        message: 'ERR_USER_NOT_FOUND',
+        message: 'Invalid email or password',
       });
     }
 
+    // 3. User account status is preserved in the response (deactivated users can log in to view data)
+
     // 4. Verify password with bcrypt
     const isMatch = await bcrypt.compare(password, user.password);
-    console.log(`[Login Verification] Password Match: ${isMatch}`);
-
     if (!isMatch) {
       return res.status(401).json({
-        message: 'ERR_PASSWORD_MISMATCH',
+        message: 'Invalid email or password',
       });
     }
 
@@ -328,7 +326,7 @@ const loginUser = async (req, res) => {
   } catch (error) {
     console.error('Login Error:', error.message);
     return res.status(500).json({
-      message: `Server Error: ${error.message}`,
+      message: 'Server error during login',
     });
   }
 };

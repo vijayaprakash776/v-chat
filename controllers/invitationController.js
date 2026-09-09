@@ -5,6 +5,7 @@ const User = require('../models/User');
 const Organization = require('../models/Organization');
 const Notification = require('../models/Notification');
 const { sendBrevoInvitationEmail } = require('../services/emailService');
+const { getPlanEntitlements } = require('../config/plans');
 
 // =========================================================================
 // ADMIN — Create Invitation
@@ -19,11 +20,11 @@ const createInvitation = async (req, res) => {
     if (!email || typeof email !== 'string' || !email.trim()) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide a valid email address',
+        message: 'Email address is required to send an invitation',
       });
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = email.trim().toLowerCase();
 
     // Basic email format validation
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -34,17 +35,20 @@ const createInvitation = async (req, res) => {
       });
     }
 
-    // 0. Enforce Free Plan member limit
+    // 0. Enforce Plan member limit (20 max for Free plan)
     const org = await Organization.findById(orgId);
-    if (org?.subscription?.plan === 'free') {
+    const planCode = org?.subscription?.plan || 'free';
+    const planEntitlements = getPlanEntitlements(planCode);
+    if (planEntitlements.maxMembers !== null) {
       const activeMembersCount = await Membership.countDocuments({
         organization: orgId,
         status: 'active'
       });
-      if (activeMembersCount >= 25) {
+      if (activeMembersCount >= planEntitlements.maxMembers) {
         return res.status(403).json({
           success: false,
-          message: 'Free plan limit reached: Maximum 25 employees allowed. Please upgrade to add more members.',
+          code: 'FREE_PLAN_LIMIT',
+          message: `Free plan limit reached: Maximum ${planEntitlements.maxMembers} workspace members allowed. Please upgrade to Professional for unlimited members.`,
         });
       }
     }
@@ -376,17 +380,20 @@ const acceptInvitation = async (req, res) => {
       });
     }
 
-    // 3.5. Enforce Free Plan member limit on accept
+    // 3.5. Enforce Plan member limit on accept
     const org = await Organization.findById(invitation.organization._id);
-    if (org?.subscription?.plan === 'free') {
+    const planCode = org?.subscription?.plan || 'free';
+    const planEntitlements = getPlanEntitlements(planCode);
+    if (planEntitlements.maxMembers !== null) {
       const activeMembersCount = await Membership.countDocuments({
         organization: invitation.organization._id,
         status: 'active'
       });
-      if (activeMembersCount >= 25) {
+      if (activeMembersCount >= planEntitlements.maxMembers) {
         return res.status(403).json({
           success: false,
-          message: 'Free plan limit reached: Maximum 25 employees allowed. Cannot join at this time.',
+          code: 'FREE_PLAN_LIMIT',
+          message: `Free plan limit reached: Maximum ${planEntitlements.maxMembers} workspace members allowed. Cannot join at this time.`,
         });
       }
     }
@@ -690,18 +697,20 @@ async function acceptInvitationByToken(req, res) {
       });
     }
 
-    // 3.5. Enforce Free Plan member limit on accept
+    // 3.5. Enforce Plan member limit on accept
     const org = await Organization.findById(invitation.organization._id);
-    if (org?.subscription?.plan === 'free') {
+    const planCode = org?.subscription?.plan || 'free';
+    const planEntitlements = getPlanEntitlements(planCode);
+    if (planEntitlements.maxMembers !== null) {
       const activeMembersCount = await Membership.countDocuments({
         organization: invitation.organization._id,
         status: 'active'
       });
-      if (activeMembersCount >= 25) {
+      if (activeMembersCount >= planEntitlements.maxMembers) {
         return res.status(403).json({
           success: false,
           code: 'FREE_PLAN_LIMIT',
-          message: 'Free plan limit reached: Maximum 25 employees allowed. Cannot join at this time.',
+          message: `Free plan limit reached: Maximum ${planEntitlements.maxMembers} workspace members allowed. Cannot join at this time.`,
         });
       }
     }

@@ -3,6 +3,8 @@ const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const Channel = require('../models/Channel');
 const User = require('../models/User');
+const Organization = require('../models/Organization');
+const { getMessageHistoryCutoffDate } = require('../config/plans');
 
 // Helper to escape regex special characters
 const escapeRegex = (string) => {
@@ -105,11 +107,18 @@ const searchAll = async (req, res) => {
         };
       }
 
+      // Apply plan message history cutoff if on FREE plan (100 days)
+      const organization = orgId ? await Organization.findById(orgId).select('subscription').lean() : null;
+      const cutoffDate = getMessageHistoryCutoffDate(organization?.subscription?.plan);
+
       const matchQuery = {
         ...scopeFilter,
         ...messageContentFilter,
         deleted: { $ne: true },
       };
+      if (cutoffDate) {
+        matchQuery.createdAt = { $gte: cutoffDate };
+      }
 
       const matchedMessages = await Message.find(matchQuery)
         .populate('sender', 'name email avatar')

@@ -11,6 +11,7 @@ const {
   addChannelMembers,
   getChannelMessages,
   sendChannelMessage,
+  promoteChannelAdmin,
   getPublicOrganizationSettings,
 } = require('../controllers/channelController');
 const { protect } = require('../middleware/authMiddleware');
@@ -40,6 +41,9 @@ router.route('/:id/leave')
 
 router.route('/:id/members')
   .post(requireActiveOrg, requireFeature('channels'), addChannelMembers);
+
+router.post('/:id/admins', requireActiveOrg, promoteChannelAdmin);
+router.post('/:id/promote-admin', requireActiveOrg, promoteChannelAdmin);
 
 router.patch('/:id/settings', updateChannelSetting);
 

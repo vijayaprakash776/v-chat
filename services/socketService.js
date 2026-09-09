@@ -9,6 +9,83 @@ let ioInstance = null;
 // Map to track connection counts per user ID: Map<userIdString, connectionCount>
 const userConnections = new Map();
 
+// Map to track active WebRTC call sessions: Map<sessionKey, sessionData>
+const activeCalls = new Map();
+
+/**
+ * Record a call history message in MongoDB and broadcast to conversation participants
+ */
+const recordCallMessage = async ({
+  callerId,
+  receiverId,
+  callType = 'audio',
+  status = 'ended',
+  duration = 0,
+  conversationId,
+  orgId,
+}) => {
+  try {
+    const Message = require('../models/Message');
+    const Conversation = require('../models/Conversation');
+
+    if (!callerId || !receiverId) return null;
+
+    let conv = null;
+    if (conversationId && mongoose.Types.ObjectId.isValid(conversationId)) {
+      conv = await Conversation.findById(conversationId);
+    }
+    if (!conv) {
+      conv = await Conversation.findOne({
+        participants: { $all: [callerId, receiverId], $size: 2 },
+      });
+    }
+
+    if (!conv) return null;
+
+    const callContent = callType === 'video' ? '📹 Video Call' : '📞 Audio Call';
+
+    const newMessage = await Message.create({
+      organization: conv.organization || orgId,
+      conversationId: conv._id,
+      sender: callerId,
+      receiver: receiverId,
+      messageType: 'call',
+      content: callContent,
+      call: {
+        callType: callType === 'video' ? 'video' : 'audio',
+        status,
+        duration: Math.max(0, duration),
+      },
+      isRead: false,
+    });
+
+    conv.lastMessage = newMessage._id;
+    conv.lastMessageAt = newMessage.createdAt;
+    await conv.save();
+
+    const populatedMessage = await Message.findById(newMessage._id).populate(
+      'sender receiver',
+      'name email avatar'
+    );
+
+    if (ioInstance) {
+      const rooms = [
+        `conversation:${conv._id.toString()}`,
+        `user:${callerId.toString()}`,
+        `user:${receiverId.toString()}`,
+      ];
+      ioInstance.to(rooms).emit('message:new', {
+        message: populatedMessage,
+      });
+    }
+
+    return populatedMessage;
+  } catch (err) {
+    console.error('Error recording call message:', err.message);
+    return null;
+  }
+};
+
 /**
  * Initialize Socket.IO with authentication middleware and event handlers
  * @param {import('socket.io').Server} io
@@ -58,12 +135,6 @@ const initSocket = (io) => {
     // Join active company room (company:<companyId>) if user has an active company
     if (orgId) {
       socket.join(`company:${orgId}`);
-    }
-
-    // Join super_admins room if user is a platform super admin
-    if (socket.user.role === 'super_admin') {
-      socket.join('super_admins');
-      console.log(`[Socket] Super Admin ${socket.user.name} joined room: super_admins`);
     }
 
     User.updateOne({ _id: userId }, { $set: { lastSeenAt: null } }).catch((error) => {
@@ -260,6 +331,145 @@ const initSocket = (io) => {
         }
       } else {
         userConnections.set(userId, remaining);
+      }
+    });
+
+    // 8. WebRTC Calling Signaling
+    socket.on('call:request', (data) => {
+      if (data.receiverId) {
+        const sessionKey = `${userId}_${data.receiverId}`;
+        activeCalls.set(sessionKey, {
+          callerId: userId,
+          receiverId: data.receiverId,
+          callType: data.callType || 'audio',
+          conversationId: data.conversationId,
+          startTime: Date.now(),
+          connected: false,
+          connectedAt: null,
+          orgId: socket.user.currentOrganization?.toString(),
+        });
+
+        io.to(`user:${data.receiverId}`).emit('call:incoming', {
+          callerId: userId,
+          callerName: socket.user.name,
+          callerAvatar: socket.user.avatar,
+          callType: data.callType,
+          conversationId: data.conversationId,
+        });
+      }
+    });
+
+    socket.on('call:accept', (data) => {
+      if (data.callerId) {
+        const sessionKey = `${data.callerId}_${userId}`;
+        const session = activeCalls.get(sessionKey);
+        if (session) {
+          session.connected = true;
+          session.connectedAt = Date.now();
+        }
+        io.to(`user:${data.callerId}`).emit('call:accepted', {
+          receiverId: userId,
+        });
+      }
+    });
+
+    socket.on('call:reject', (data) => {
+      if (data.callerId) {
+        const sessionKey = `${data.callerId}_${userId}`;
+        const session = activeCalls.get(sessionKey);
+        if (session) {
+          activeCalls.delete(sessionKey);
+        }
+
+        recordCallMessage({
+          callerId: data.callerId,
+          receiverId: userId,
+          callType: session?.callType || data.callType || 'audio',
+          status: 'declined',
+          duration: 0,
+          conversationId: session?.conversationId || data.conversationId,
+          orgId: socket.user.currentOrganization?.toString(),
+        });
+
+        io.to(`user:${data.callerId}`).emit('call:rejected', {
+          receiverId: userId,
+        });
+      }
+    });
+
+    socket.on('call:offer', (data) => {
+      if (data.targetId) {
+        io.to(`user:${data.targetId}`).emit('call:offer', {
+          senderId: userId,
+          offer: data.offer,
+        });
+      }
+    });
+
+    socket.on('call:answer', (data) => {
+      if (data.targetId) {
+        io.to(`user:${data.targetId}`).emit('call:answer', {
+          senderId: userId,
+          answer: data.answer,
+        });
+      }
+    });
+
+    socket.on('call:ice-candidate', (data) => {
+      if (data.targetId) {
+        io.to(`user:${data.targetId}`).emit('call:ice-candidate', {
+          senderId: userId,
+          candidate: data.candidate,
+        });
+      }
+    });
+
+    socket.on('call:end', (data) => {
+      if (data.targetId) {
+        const key1 = `${userId}_${data.targetId}`;
+        const key2 = `${data.targetId}_${userId}`;
+        const session = activeCalls.get(key1) || activeCalls.get(key2);
+
+        if (session) {
+          activeCalls.delete(key1);
+          activeCalls.delete(key2);
+        }
+
+        const callerId = session?.callerId || (data.isCaller ? userId : data.targetId);
+        const receiverId = session?.receiverId || (data.isCaller ? data.targetId : userId);
+        const callType = session?.callType || data.callType || 'audio';
+        const conversationId = session?.conversationId || data.conversationId;
+
+        let status = 'ended';
+        let duration = 0;
+
+        if (session && session.connected && session.connectedAt) {
+          status = 'ended';
+          duration = Math.max(1, Math.round((Date.now() - session.connectedAt) / 1000));
+        } else if (data.duration && data.duration > 0) {
+          status = 'ended';
+          duration = data.duration;
+        } else if (session && !session.connected) {
+          status = userId === session.callerId ? 'cancelled' : 'missed';
+          duration = 0;
+        } else {
+          status = data.status || 'ended';
+          duration = data.duration || 0;
+        }
+
+        recordCallMessage({
+          callerId,
+          receiverId,
+          callType,
+          status,
+          duration,
+          conversationId,
+          orgId: socket.user.currentOrganization?.toString(),
+        });
+
+        io.to(`user:${data.targetId}`).emit('call:ended', {
+          senderId: userId,
+        });
       }
     });
   });

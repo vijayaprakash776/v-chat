@@ -2,8 +2,10 @@ const mongoose = require('mongoose');
 const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const User = require('../models/User');
+const Organization = require('../models/Organization');
 const Notification = require('../models/Notification');
 const { notifyDirectMessage } = require('../services/notificationService');
+const { getMessageHistoryCutoffDate } = require('../config/plans');
 
 // @desc    Create or get existing 1-to-1 conversation
 // @route   POST /api/conversations
@@ -74,10 +76,10 @@ const createOrGetConversation = async (req, res) => {
           { participants: { $all: [senderId], $size: 1 } },
         ],
       })
-        .populate('participants', 'name email avatar')
+        .populate('participants', 'name email avatar lastSeenAt')
         .populate({
           path: 'lastMessage',
-          populate: { path: 'sender receiver', select: 'name email avatar' },
+          populate: { path: 'sender receiver', select: 'name email avatar lastSeenAt' },
         })
         .sort({ lastMessageAt: -1, updatedAt: -1 });
 
@@ -112,10 +114,10 @@ const createOrGetConversation = async (req, res) => {
         },
         { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
       )
-        .populate('participants', 'name email avatar')
+        .populate('participants', 'name email avatar lastSeenAt')
         .populate({
           path: 'lastMessage',
-          populate: { path: 'sender receiver', select: 'name email avatar' },
+          populate: { path: 'sender receiver', select: 'name email avatar lastSeenAt' },
         });
 
       return res.status(200).json({
@@ -130,10 +132,10 @@ const createOrGetConversation = async (req, res) => {
       organization: orgId,
       participants: { $all: participantIds, $size: 2 },
     })
-      .populate('participants', 'name email avatar')
+      .populate('participants', 'name email avatar lastSeenAt')
       .populate({
         path: 'lastMessage',
-        populate: { path: 'sender receiver', select: 'name email avatar' },
+        populate: { path: 'sender receiver', select: 'name email avatar lastSeenAt' },
       });
 
     // If conversation already exists, return it (idempotent)
@@ -175,7 +177,7 @@ const createOrGetConversation = async (req, res) => {
 
     conversation = await Conversation.findById(conversation._id).populate(
       'participants',
-      'name email avatar'
+      'name email avatar lastSeenAt'
     );
 
     return res.status(201).json({
@@ -211,10 +213,10 @@ const getUserConversations = async (req, res) => {
       organization: orgId,
       participants: userId,
     })
-      .populate('participants', 'name email avatar')
+      .populate('participants', 'name email avatar lastSeenAt')
       .populate({
         path: 'lastMessage',
-        populate: { path: 'sender receiver', select: 'name email avatar' },
+        populate: { path: 'sender receiver', select: 'name email avatar lastSeenAt' },
       })
       .sort({ lastMessageAt: -1, updatedAt: -1 });
 
@@ -255,10 +257,10 @@ const getUserConversations = async (req, res) => {
           },
           { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
         )
-          .populate('participants', 'name email avatar')
+          .populate('participants', 'name email avatar lastSeenAt')
           .populate({
             path: 'lastMessage',
-            populate: { path: 'sender receiver', select: 'name email avatar' },
+            populate: { path: 'sender receiver', select: 'name email avatar lastSeenAt' },
           });
       } catch (selfErr) {
         console.warn('Could not auto-upsert self-conversation:', selfErr.message);
@@ -279,10 +281,41 @@ const getUserConversations = async (req, res) => {
       ? [primarySelfConv, ...uniqueOtherConvs]
       : uniqueOtherConvs;
 
+    // Calculate persistent unread count for each conversation for requesting user
+    const conversationsWithUnread = await Promise.all(
+      sanitizedConversations.map(async (conv) => {
+        const convObj = conv.toObject ? conv.toObject() : { ...conv };
+        const isSelf =
+          conv.isSelf ||
+          (Array.isArray(conv.participants) &&
+            conv.participants.length > 0 &&
+            conv.participants.every(
+              (p) => (p._id || p.id || p)?.toString() === userId.toString()
+            ));
+
+        if (isSelf) {
+          // Self-chat messages must never be unread. Clear any historical unread messages in DB for this self-conversation
+          await Message.updateMany(
+            { conversationId: conv._id, isRead: false },
+            { $set: { isRead: true } }
+          );
+          convObj.unread = 0;
+        } else {
+          const unreadCount = await Message.countDocuments({
+            conversationId: conv._id,
+            receiver: userId,
+            isRead: false,
+          });
+          convObj.unread = unreadCount;
+        }
+        return convObj;
+      })
+    );
+
     return res.status(200).json({
       success: true,
-      count: sanitizedConversations.length,
-      conversations: sanitizedConversations,
+      count: conversationsWithUnread.length,
+      conversations: conversationsWithUnread,
     });
   } catch (error) {
     console.error('Get Conversations Error:', error.message);
@@ -442,27 +475,34 @@ const getConversationMessages = async (req, res) => {
     const limit = req.query.limit ? Math.min(parseInt(req.query.limit, 10) || 50, 100) : 0;
     const before = req.query.before; // ISO date string or timestamp
 
+    // Apply plan message history cutoff if on FREE plan (100 days)
+    const organization = conversation.organization ? await Organization.findById(conversation.organization).select('subscription').lean() : null;
+    const cutoffDate = getMessageHistoryCutoffDate(organization?.subscription?.plan);
+
     const query = {
       conversationId,
       deletedFor: { $ne: userId },
     };
+    if (cutoffDate) {
+      query.createdAt = { $gte: cutoffDate };
+    }
     if (before) {
       const beforeDate = new Date(before);
       if (!isNaN(beforeDate.getTime())) {
-        query.createdAt = { $lt: beforeDate };
+        query.createdAt = query.createdAt ? { ...query.createdAt, $lt: beforeDate } : { $lt: beforeDate };
       }
     }
 
     const messagesQuery = Message.find(query)
-      .populate('sender', 'name email avatar')
-      .populate('receiver', 'name email avatar')
+      .populate('sender', 'name email avatar lastSeenAt')
+      .populate('receiver', 'name email avatar lastSeenAt')
       .populate({
         path: 'replyTo',
-        populate: { path: 'sender', select: 'name email avatar' },
+        populate: { path: 'sender', select: 'name email avatar lastSeenAt' },
       })
       .populate({
         path: 'forwardedFrom',
-        populate: { path: 'sender', select: 'name email avatar' },
+        populate: { path: 'sender', select: 'name email avatar lastSeenAt' },
       });
 
     if (limit > 0) {
@@ -472,10 +512,14 @@ const getConversationMessages = async (req, res) => {
       const oldestMessageDate = messages.length > 0 ? messages[0].createdAt : null;
       let hasMore = false;
       if (oldestMessageDate) {
-        const olderCount = await Message.countDocuments({
+        const olderCountQuery = {
           conversationId,
           createdAt: { $lt: oldestMessageDate },
-        });
+        };
+        if (cutoffDate) {
+          olderCountQuery.createdAt.$gte = cutoffDate;
+        }
+        const olderCount = await Message.countDocuments(olderCountQuery);
         hasMore = olderCount > 0;
       }
 
@@ -608,6 +652,8 @@ const sendMessage = async (req, res) => {
       (p) => p.toString() !== senderId
     ) || senderId;
 
+    const isSelf = receiverId.toString() === senderId.toString();
+
     // Create the message in MongoDB
     const newMessage = await Message.create({
       organization: conversation.organization,
@@ -619,7 +665,7 @@ const sendMessage = async (req, res) => {
       attachments,
       poll,
       replyTo: replyTo && mongoose.Types.ObjectId.isValid(replyTo) ? replyTo : null,
-      isRead: false,
+      isRead: isSelf ? true : false,
     });
 
     // Update conversation metadata
@@ -629,29 +675,29 @@ const sendMessage = async (req, res) => {
 
     // Populate sender, receiver, and references
     const populatedMessage = await Message.findById(newMessage._id)
-      .populate('sender', 'name email avatar')
-      .populate('receiver', 'name email avatar')
+      .populate('sender', 'name email avatar lastSeenAt')
+      .populate('receiver', 'name email avatar lastSeenAt')
       .populate({
         path: 'replyTo',
-        populate: { path: 'sender', select: 'name email avatar' },
+        populate: { path: 'sender', select: 'name email avatar lastSeenAt' },
       })
       .populate({
         path: 'forwardedFrom',
-        populate: { path: 'sender', select: 'name email avatar' },
+        populate: { path: 'sender', select: 'name email avatar lastSeenAt' },
       });
 
     // Real-Time Socket.IO event emission
     const io = req.app.get('io');
     if (io) {
       // Emit to conversation room AND all other participants' user rooms
-      const convEmitter = io.to(`conversation:${conversationId}`);
+      const rooms = [`conversation:${conversationId}`];
       for (const p of conversation.participants || []) {
         const pid = (p._id || p).toString();
         if (pid !== senderId) {
-          convEmitter.to(`user:${pid}`);
+          rooms.push(`user:${pid}`);
         }
       }
-      convEmitter.emit('message:new', {
+      io.to(rooms).emit('message:new', {
         message: populatedMessage,
       });
 

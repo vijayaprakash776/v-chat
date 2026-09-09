@@ -2,8 +2,12 @@ const Organization = require('../models/Organization');
 const Membership = require('../models/Membership');
 const JoinRequest = require('../models/JoinRequest');
 const User = require('../models/User');
+const Channel = require('../models/Channel');
+const Message = require('../models/Message');
 const AuditLog = require('../models/AuditLog');
 const Notification = require('../models/Notification');
+const mongoose = require('mongoose');
+const { getPlanEntitlements, getOrganizationStorageLimitBytes } = require('../config/plans');
 
 // Helper to escape regex special characters
 const escapeRegex = (string) => {
@@ -382,11 +386,181 @@ const switchOrganization = async (req, res) => {
   }
 };
 
+// @desc    Get plan details, entitlements, and usage for organization
+// @route   GET /api/organizations/:id/plan
+// @access  Private
+const getOrganizationPlanDetails = async (req, res) => {
+  try {
+    let orgId = req.params.id;
+    if (!orgId || orgId === 'current') {
+      orgId = req.user.currentOrganizationId;
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(orgId)) {
+      return res.status(400).json({ success: false, message: 'Invalid organization ID format' });
+    }
+
+    // Authorization: User must be an active member of this org
+    const membership = await Membership.findOne({
+      user: req.user.id,
+      organization: orgId,
+      status: 'active',
+    });
+
+    if (!membership) {
+      return res.status(403).json({ success: false, message: 'Access denied to organization plan details' });
+    }
+
+    const org = await Organization.findById(orgId);
+    if (!org) {
+      return res.status(404).json({ success: false, message: 'Organization not found' });
+    }
+
+    const planCode = org.subscription?.plan || 'free';
+    const entitlements = getPlanEntitlements(planCode);
+
+    const activeMemberCount = await Membership.countDocuments({ organization: orgId, status: 'active' });
+    const channelCount = await Channel.countDocuments({ organization: orgId });
+
+    const storageResult = await Message.aggregate([
+      { $match: { organization: new mongoose.Types.ObjectId(orgId), 'attachments.0': { $exists: true } } },
+      { $unwind: '$attachments' },
+      { $group: { _id: null, totalUsedBytes: { $sum: '$attachments.fileSize' } } },
+    ]);
+    const usedStorageBytes = storageResult[0]?.totalUsedBytes || 0;
+    const totalStorageLimitBytes = getOrganizationStorageLimitBytes(planCode, activeMemberCount);
+
+    return res.status(200).json({
+      success: true,
+      organizationId: org._id,
+      organizationName: org.name,
+      plan: planCode,
+      entitlements,
+      usage: {
+        members: {
+          current: activeMemberCount,
+          max: entitlements.maxMembers,
+          isLimitReached: entitlements.maxMembers ? activeMemberCount >= entitlements.maxMembers : false,
+        },
+        channels: {
+          current: channelCount,
+          max: entitlements.maxChannels,
+          isLimitReached: entitlements.maxChannels ? channelCount >= entitlements.maxChannels : false,
+        },
+        storage: {
+          usedBytes: usedStorageBytes,
+          usedFormatted: `${(usedStorageBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
+          totalLimitBytes: totalStorageLimitBytes,
+          limitFormatted: `${(totalStorageLimitBytes / (1024 * 1024 * 1024)).toFixed(1)} GB`,
+          isLimitReached: usedStorageBytes >= totalStorageLimitBytes,
+        },
+        maxFileSizeBytes: entitlements.maxFileSizeBytes,
+        maxFileSizeMB: entitlements.maxFileSizeMB,
+        messageHistoryCutoffDays: entitlements.messageHistoryCutoffDays,
+      },
+    });
+  } catch (error) {
+    console.error('Get Organization Plan Error:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error fetching plan details' });
+  }
+};
+
+// @desc    Upgrade organization plan from FREE to PROFESSIONAL (non-destructive)
+// @route   POST /api/organizations/:id/upgrade
+// @access  Private (Org Admin / Owner only)
+const upgradeOrganizationPlan = async (req, res) => {
+  try {
+    let orgId = req.params.id;
+    if (!orgId || orgId === 'current') {
+      orgId = req.user.currentOrganizationId;
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(orgId)) {
+      return res.status(400).json({ success: false, message: 'Invalid organization ID format' });
+    }
+
+    // Check membership and role: Only admin/owner in the org or system admin can upgrade
+    const membership = await Membership.findOne({
+      user: req.user.id,
+      organization: orgId,
+      status: 'active',
+    });
+
+    const isOrgAdmin = membership && ['admin', 'owner'].includes(membership.role);
+    const isSysAdmin = req.user.role === 'admin';
+
+    if (!isOrgAdmin && !isSysAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only an organization admin or owner can upgrade subscription plans',
+      });
+    }
+
+    const org = await Organization.findById(orgId);
+    if (!org) {
+      return res.status(404).json({ success: false, message: 'Organization not found' });
+    }
+
+    const targetPlan = (req.body.plan || 'professional').toLowerCase();
+    if (targetPlan !== 'professional') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid plan requested. Supported upgrade target: "professional"',
+      });
+    }
+
+    // Safely update plan without resetting or deleting existing data
+    if (!org.subscription) {
+      org.subscription = {};
+    }
+    org.subscription.plan = 'professional';
+    org.subscription.status = 'active';
+    org.subscription.updatedAt = new Date();
+
+    await org.save();
+
+    // Log Audit Record
+    await createOrgAuditRecord({
+      adminId: req.user.id,
+      organizationId: org._id,
+      action: 'UPGRADE_PLAN',
+      targetType: 'Organization',
+      targetId: org._id.toString(),
+      targetName: org.name,
+      details: `Upgraded workspace plan to Professional (${org.subscription.plan})`,
+    });
+
+    const entitlements = getPlanEntitlements('professional');
+
+    // Socket.IO emission to notify all connected workspace users of plan upgrade
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`company:${org._id.toString()}`).emit('organization:plan_upgraded', {
+        organizationId: org._id,
+        plan: 'professional',
+        entitlements,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Successfully upgraded workspace "${org.name}" to Professional plan!`,
+      organization: org,
+      entitlements,
+    });
+  } catch (error) {
+    console.error('Upgrade Organization Plan Error:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error upgrading plan' });
+  }
+};
+
 module.exports = {
   registerAndCreateCompany,
   createOrganization,
   getMyOrganizations,
   switchOrganization,
+  getOrganizationPlanDetails,
+  upgradeOrganizationPlan,
   createOrgAuditRecord,
 };
 

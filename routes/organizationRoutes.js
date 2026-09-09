@@ -5,6 +5,8 @@ const {
   createOrganization,
   getMyOrganizations,
   switchOrganization,
+  getOrganizationPlanDetails,
+  upgradeOrganizationPlan,
 } = require('../controllers/organizationController');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -17,6 +19,8 @@ router.use(protect);
 router.post('/', createOrganization);
 router.get('/my', getMyOrganizations);
 router.post('/:id/switch', switchOrganization);
+router.get('/:id/plan', getOrganizationPlanDetails);
+router.post('/:id/upgrade', upgradeOrganizationPlan);
 
 module.exports = router;
 

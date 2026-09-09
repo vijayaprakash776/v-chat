@@ -3,18 +3,21 @@ const Channel = require('../models/Channel');
 const Message = require('../models/Message');
 const User = require('../models/User');
 const Membership = require('../models/Membership');
+const Organization = require('../models/Organization');
 const OrganizationSettings = require('../models/OrganizationSettings');
 const { notifyChannelMessage } = require('../services/notificationService');
+const { getPlanEntitlements, getMessageHistoryCutoffDate } = require('../config/plans');
 
 // @desc    Create a new channel
 // @route   POST /api/channels
 // @access  Private
 const createChannel = async (req, res) => {
   try {
-    const { name, description = '', isPrivate = false } = req.body;
+    const { name, description = '', isPrivate = false, isAdminOnly = false, adminOnly = false } = req.body;
     const userId = req.user.id;
     const userRole = req.user.role || 'user';
     const isPrivateBool = Boolean(isPrivate);
+    const isAdminOnlyBool = Boolean(isAdminOnly || adminOnly);
 
     // Enforce Organization Settings for channel creation
     const orgSettings = await OrganizationSettings.getSettings();
@@ -51,6 +54,23 @@ const createChannel = async (req, res) => {
 
     // Check if channel name is already taken in this organization
     const orgId = req.user.currentOrganizationId;
+
+    // Enforce Plan Channel Limit (Max 10 channels for Free plan, unlimited for Professional)
+    if (orgId) {
+      const organization = await Organization.findById(orgId).select('subscription').lean();
+      const planEntitlements = getPlanEntitlements(organization?.subscription?.plan);
+      if (planEntitlements.maxChannels !== null) {
+        const currentChannelCount = await Channel.countDocuments({ organization: orgId });
+        if (currentChannelCount >= planEntitlements.maxChannels) {
+          return res.status(403).json({
+            success: false,
+            message: `Free plan channel limit reached (${planEntitlements.maxChannels} channels maximum). Upgrade to Professional for unlimited channels.`,
+            code: 'PLAN_LIMIT_REACHED',
+          });
+        }
+      }
+    }
+
     const existingChannel = await Channel.findOne({
       organization: orgId,
       name: { $regex: new RegExp(`^${cleanName}$`, 'i') },
@@ -63,13 +83,15 @@ const createChannel = async (req, res) => {
       });
     }
 
-    // Create channel with creator as the first member
+    // Create channel with creator as the first member and first admin
     const newChannel = await Channel.create({
       organization: orgId,
       name: cleanName,
       description: description.trim(),
       createdBy: userId,
       members: [userId],
+      admins: [userId],
+      isAdminOnly: isAdminOnlyBool,
       isPrivate: isPrivateBool,
       isArchived: false,
       lastMessageAt: new Date(),
@@ -77,6 +99,7 @@ const createChannel = async (req, res) => {
 
     const populatedChannel = await Channel.findById(newChannel._id)
       .populate('members', 'name email avatar')
+      .populate('admins', 'name email avatar')
       .populate('createdBy', 'name email avatar');
 
     // Real-Time Socket.IO emission
@@ -126,6 +149,8 @@ const getChannels = async (req, res) => {
       $or: [{ isPrivate: false }, { members: userId }],
     })
       .populate('members', 'name email avatar')
+      .populate('admins', 'name email avatar')
+      .populate('createdBy', 'name email avatar')
       .populate({
         path: 'lastMessage',
         populate: { path: 'sender', select: 'name email avatar' },
@@ -142,10 +167,22 @@ const getChannels = async (req, res) => {
       return chObj;
     });
 
+    // Calculate persistent unread message count for each channel for requesting user
+    const channelsWithUnread = await Promise.all(
+      sanitizedChannels.map(async (ch) => {
+        const unreadCount = await Message.countDocuments({
+          channelId: ch._id,
+          sender: { $ne: userId },
+          'readBy.userId': { $ne: userId },
+        });
+        return { ...ch, unread: unreadCount };
+      })
+    );
+
     return res.status(200).json({
       success: true,
-      count: sanitizedChannels.length,
-      channels: sanitizedChannels,
+      count: channelsWithUnread.length,
+      channels: channelsWithUnread,
     });
   } catch (error) {
     console.error('Get Channels Error:', error.message);
@@ -196,6 +233,7 @@ const getChannel = async (req, res) => {
 
     const channel = await Channel.findById(id)
       .populate('members', 'name email avatar')
+      .populate('admins', 'name email avatar')
       .populate('createdBy', 'name email avatar')
       .populate({
         path: 'lastMessage',
@@ -298,6 +336,8 @@ const joinChannel = async (req, res) => {
 
     const populated = await Channel.findById(id)
       .populate('members', 'name email avatar')
+      .populate('admins', 'name email avatar')
+      .populate('createdBy', 'name email avatar')
       .populate({
         path: 'lastMessage',
         populate: { path: 'sender', select: 'name email avatar' },
@@ -565,14 +605,21 @@ const getChannelMessages = async (req, res) => {
     const limit = req.query.limit ? Math.min(parseInt(req.query.limit, 10) || 50, 100) : 0;
     const before = req.query.before;
 
+    // Apply plan message history cutoff if on FREE plan (100 days)
+    const organization = channel.organization ? await Organization.findById(channel.organization).select('subscription').lean() : null;
+    const cutoffDate = getMessageHistoryCutoffDate(organization?.subscription?.plan);
+
     const query = {
       channelId: id,
       deletedFor: { $ne: userId },
     };
+    if (cutoffDate) {
+      query.createdAt = { $gte: cutoffDate };
+    }
     if (before) {
       const beforeDate = new Date(before);
       if (!isNaN(beforeDate.getTime())) {
-        query.createdAt = { $lt: beforeDate };
+        query.createdAt = query.createdAt ? { ...query.createdAt, $lt: beforeDate } : { $lt: beforeDate };
       }
     }
 
@@ -594,10 +641,14 @@ const getChannelMessages = async (req, res) => {
       const oldestMessageDate = messages.length > 0 ? messages[0].createdAt : null;
       let hasMore = false;
       if (oldestMessageDate) {
-        const olderCount = await Message.countDocuments({
+        const olderCountQuery = {
           channelId: id,
           createdAt: { $lt: oldestMessageDate },
-        });
+        };
+        if (cutoffDate) {
+          olderCountQuery.createdAt.$gte = cutoffDate;
+        }
+        const olderCount = await Message.countDocuments(olderCountQuery);
         hasMore = olderCount > 0;
       }
 
@@ -633,7 +684,7 @@ const sendChannelMessage = async (req, res) => {
   try {
     const { id } = req.params;
     let content = req.body.content ? req.body.content.trim() : '';
-    const replyTo = req.body.replyTo || null;
+    const replyTo = req.body.replyTo ? req.body.replyTo.toString().trim() : null;
     const senderId = req.user.id;
 
     // Parse uploaded files (if any)
@@ -681,13 +732,54 @@ const sendChannelMessage = async (req, res) => {
       });
     }
 
+    const senderIdStr = senderId.toString();
+
     // Authorization: User must be a member to send channel messages
-    const isMember = channel.members.some((m) => m.toString() === senderId);
+    const isMember = (channel.members || []).some((m) => (m?._id || m?.id || m)?.toString() === senderIdStr);
     if (!isMember) {
       return res.status(403).json({
         success: false,
         message: 'You must join this channel to send messages',
       });
+    }
+
+    // Admin Only Channel Check: Only channel admins, creator, or org admins can post top-level announcements.
+    // Non-admin members are permitted to reply to existing messages in the channel.
+    if (channel.isAdminOnly) {
+      const creatorIdStr = (channel.createdBy?._id || channel.createdBy?.id || channel.createdBy)?.toString();
+      const isCreator = Boolean(creatorIdStr && creatorIdStr === senderIdStr);
+      const isChannelAdmin = (channel.admins || []).some(
+        (a) => (a?._id || a?.id || a)?.toString() === senderIdStr
+      );
+      const isOrgAdmin = ['admin', 'owner', 'super_admin'].includes(req.user.role) || ['admin', 'owner', 'super_admin'].includes(req.user.globalRole);
+
+      if (!isCreator && !isChannelAdmin && !isOrgAdmin) {
+        if (!replyTo) {
+          return res.status(403).json({
+            success: false,
+            message: 'Only channel admins can send messages in this channel',
+          });
+        }
+
+        if (!mongoose.Types.ObjectId.isValid(replyTo)) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid reply message ID format',
+          });
+        }
+
+        const parentMessage = await Message.findOne({
+          _id: replyTo,
+          channelId: id,
+        });
+
+        if (!parentMessage) {
+          return res.status(400).json({
+            success: false,
+            message: 'Referenced message to reply to was not found in this channel',
+          });
+        }
+      }
     }
 
     // Determine messageType & Poll parsing
@@ -887,10 +979,15 @@ const updateChannel = async (req, res) => {
     }
 
     // Only creator or admin can update channel details
-    const isCreator = channel.createdBy?.toString() === userId;
-    const isAdmin = userRole === 'admin';
+    const userIdStr = userId.toString();
+    const creatorIdStr = (channel.createdBy?._id || channel.createdBy?.id || channel.createdBy)?.toString();
+    const isCreator = Boolean(creatorIdStr && creatorIdStr === userIdStr);
+    const isChannelAdmin = (channel.admins || []).some(
+      (a) => (a?._id || a?.id || a)?.toString() === userIdStr
+    );
+    const isAdmin = ['admin', 'owner'].includes(userRole);
 
-    if (!isCreator && !isAdmin) {
+    if (!isCreator && !isChannelAdmin && !isAdmin) {
       return res.status(403).json({
         success: false,
         message: 'Only the channel creator or an admin can edit this channel',
@@ -918,10 +1015,16 @@ const updateChannel = async (req, res) => {
       channel.description = description.trim();
     }
 
+    const { isAdminOnly, adminOnly } = req.body;
+    if (isAdminOnly !== undefined || adminOnly !== undefined) {
+      channel.isAdminOnly = Boolean(isAdminOnly !== undefined ? isAdminOnly : adminOnly);
+    }
+
     await channel.save();
 
     const populated = await Channel.findById(id)
       .populate('members', 'name email avatar')
+      .populate('admins', 'name email avatar')
       .populate('createdBy', 'name email avatar')
       .populate({
         path: 'lastMessage',
@@ -932,6 +1035,7 @@ const updateChannel = async (req, res) => {
     const io = req.app.get('io');
     if (io) {
       io.to(`company:${channel.organization}`).emit('channel:updated', { channel: populated });
+      io.to(`channel:${id}`).emit('channel:updated', { channel: populated });
     }
 
     return res.status(200).json({
@@ -944,6 +1048,109 @@ const updateChannel = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Server error updating channel',
+    });
+  }
+};
+
+// @desc    Promote a channel member to Channel Admin
+// @route   POST /api/channels/:id/admins
+// @access  Private (Channel Admin, Creator, or Org Admin)
+const promoteChannelAdmin = async (req, res) => {
+  try {
+    const { id } = req.params;
+    let { userId: targetUserId } = req.body;
+    if (!targetUserId && req.body.memberId) {
+      targetUserId = req.body.memberId;
+    }
+
+    const currentUserId = req.user.id;
+    const userRole = req.user.role;
+
+    if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(targetUserId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid channel ID or target user ID format',
+      });
+    }
+
+    const channel = await Channel.findById(id);
+    if (!channel) {
+      return res.status(404).json({
+        success: false,
+        message: 'Channel not found',
+      });
+    }
+
+    // Enforce Company Isolation
+    if (channel.organization && channel.organization.toString() !== req.user.currentOrganizationId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: Channel belongs to another workspace',
+      });
+    }
+
+    // Check permission: requester must be channel creator, channel admin, or org admin
+    const currentUserIdStr = currentUserId.toString();
+    const creatorIdStr = (channel.createdBy?._id || channel.createdBy?.id || channel.createdBy)?.toString();
+    const isCreator = Boolean(creatorIdStr && creatorIdStr === currentUserIdStr);
+    const isChannelAdmin = (channel.admins || []).some(
+      (a) => (a?._id || a?.id || a)?.toString() === currentUserIdStr
+    );
+    const isOrgAdmin = ['admin', 'owner'].includes(userRole);
+
+    if (!isCreator && !isChannelAdmin && !isOrgAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only channel admins can promote members to admin',
+      });
+    }
+
+    // Verify target user is a member of the channel
+    const isMember = (channel.members || []).some(
+      (m) => (m?._id || m?.id || m)?.toString() === targetUserId.toString()
+    );
+    if (!isMember) {
+      return res.status(400).json({
+        success: false,
+        message: 'Target user must be a member of the channel to be promoted',
+      });
+    }
+
+    // Add targetUserId to admins if not already present
+    const alreadyAdmin = (channel.admins || []).some((a) => a.toString() === targetUserId.toString());
+    if (!alreadyAdmin) {
+      if (!channel.admins) channel.admins = [];
+      channel.admins.push(targetUserId);
+      await channel.save();
+    }
+
+    const populated = await Channel.findById(id)
+      .populate('members', 'name email avatar')
+      .populate('admins', 'name email avatar')
+      .populate('createdBy', 'name email avatar')
+      .populate({
+        path: 'lastMessage',
+        populate: { path: 'sender', select: 'name email avatar' },
+      });
+
+    // Real-Time Socket.IO emission to company, channel, and target user
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`channel:${id}`).emit('channel:updated', { channel: populated });
+      io.to(`company:${channel.organization}`).emit('channel:updated', { channel: populated });
+      io.to(`user:${targetUserId}`).emit('channel:updated', { channel: populated });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Member promoted to Channel Admin successfully',
+      channel: populated,
+    });
+  } catch (error) {
+    console.error('Promote Channel Admin Error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error promoting channel admin',
     });
   }
 };
@@ -975,6 +1182,7 @@ module.exports = {
   createChannel,
   getChannels,
   updateChannel,
+  promoteChannelAdmin,
   updateChannelSetting,
   getChannel,
   joinChannel,

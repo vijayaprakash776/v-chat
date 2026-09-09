@@ -1,6 +1,11 @@
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const mongoose = require('mongoose');
+const Organization = require('../models/Organization');
+const Membership = require('../models/Membership');
+const Message = require('../models/Message');
+const { getPlanEntitlements, getOrganizationStorageLimitBytes } = require('../config/plans');
 
 // Ensure uploads directory exists
 const uploadDir = path.join(__dirname, '../uploads');
@@ -106,12 +111,12 @@ const handleUpload = (fieldName = 'files', maxCount = 5) => {
   const uploadMiddleware = upload.array(fieldName, maxCount);
 
   return (req, res, next) => {
-    uploadMiddleware(req, res, (err) => {
+    uploadMiddleware(req, res, async (err) => {
       if (err instanceof multer.MulterError) {
         if (err.code === 'LIMIT_FILE_SIZE') {
           return res.status(413).json({
             success: false,
-            message: `File upload error: File exceeds the maximum allowed size limit.`,
+            message: `File upload error: File exceeds maximum allowed size.`,
           });
         }
         return res.status(400).json({
@@ -125,48 +130,76 @@ const handleUpload = (fieldName = 'files', maxCount = 5) => {
         });
       }
 
-      // Check per-file size limits: Images <= 20MB, Documents <= 100MB, Videos <= 500MB
       if (req.files && req.files.length > 0) {
         if (!req.file) {
           req.file = req.files[0];
         }
-        for (const file of req.files) {
-          const ext = path.extname(file.originalname).toLowerCase();
-          const isVideo =
-            file.mimetype.startsWith('video/') ||
-            ALLOWED_VIDEO_EXTENSIONS.has(ext);
-          const isImage =
-            file.mimetype.startsWith('image/') ||
-            ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp'].includes(ext);
 
-          if (isVideo && file.size > MAX_VIDEO_SIZE_BYTES) {
-            if (file.path && fs.existsSync(file.path)) {
-              fs.unlinkSync(file.path);
+        const cleanupUploadedFiles = () => {
+          for (const f of req.files) {
+            if (f.path && fs.existsSync(f.path)) {
+              try { fs.unlinkSync(f.path); } catch (e) {}
             }
+          }
+        };
+
+        // Get organization plan & entitlement specs
+        const orgId = req.user?.currentOrganizationId;
+        let planEntitlements = getPlanEntitlements('free');
+        let activeMemberCount = 1;
+
+        if (orgId) {
+          try {
+            const org = await Organization.findById(orgId).select('subscription').lean();
+            planEntitlements = getPlanEntitlements(org?.subscription?.plan);
+            activeMemberCount = await Membership.countDocuments({ organization: orgId, status: 'active' });
+          } catch (e) {
+            console.error('Error loading org plan in uploadMiddleware:', e.message);
+          }
+        }
+
+        const maxFileSizeBytes = planEntitlements.maxFileSizeBytes;
+        const maxFileSizeMB = planEntitlements.maxFileSizeMB;
+        let incomingBatchSize = 0;
+
+        for (const file of req.files) {
+          incomingBatchSize += file.size;
+
+          // Check plan max per-file size limit (Free: 50MB, Professional: 200MB)
+          if (file.size > maxFileSizeBytes) {
+            cleanupUploadedFiles();
             return res.status(413).json({
               success: false,
-              message: `Video "${file.originalname}" exceeds the maximum allowed size of 500MB.`,
+              message: `File "${file.originalname}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) exceeds maximum allowed size of ${maxFileSizeMB} MB for ${planEntitlements.name} plan.`,
+              code: 'PLAN_FILE_SIZE_EXCEEDED',
             });
           }
+        }
 
-          if (isImage && file.size > MAX_IMAGE_SIZE_BYTES) {
-            if (file.path && fs.existsSync(file.path)) {
-              fs.unlinkSync(file.path);
-            }
-            return res.status(400).json({
-              success: false,
-              message: `Image "${file.originalname}" exceeds the maximum allowed size of 20MB.`,
-            });
-          }
+        // Check total workspace storage limit (Free: 10GB shared, Professional: 10GB per user)
+        if (orgId) {
+          try {
+            const totalStorageLimitBytes = getOrganizationStorageLimitBytes(planEntitlements.code, activeMemberCount);
 
-          if (!isVideo && !isImage && file.size > MAX_DOC_SIZE_BYTES) {
-            if (file.path && fs.existsSync(file.path)) {
-              fs.unlinkSync(file.path);
+            const storageResult = await Message.aggregate([
+              { $match: { organization: new mongoose.Types.ObjectId(orgId), 'attachments.0': { $exists: true } } },
+              { $unwind: '$attachments' },
+              { $group: { _id: null, totalUsedBytes: { $sum: '$attachments.fileSize' } } },
+            ]);
+            const currentUsedBytes = storageResult[0]?.totalUsedBytes || 0;
+
+            if (currentUsedBytes + incomingBatchSize > totalStorageLimitBytes) {
+              cleanupUploadedFiles();
+              const limitGB = (totalStorageLimitBytes / (1024 * 1024 * 1024)).toFixed(1);
+              const usedGB = (currentUsedBytes / (1024 * 1024 * 1024)).toFixed(2);
+              return res.status(413).json({
+                success: false,
+                message: `Workspace storage limit reached (${usedGB} GB of ${limitGB} GB used). Upgrade to Professional for more storage capacity.`,
+                code: 'PLAN_STORAGE_EXCEEDED',
+              });
             }
-            return res.status(400).json({
-              success: false,
-              message: `Document "${file.originalname}" exceeds the maximum allowed size of 100MB.`,
-            });
+          } catch (e) {
+            console.error('Error checking org storage limits:', e.message);
           }
         }
       }
