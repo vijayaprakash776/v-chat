@@ -60,6 +60,12 @@ const initSocket = (io) => {
       socket.join(`company:${orgId}`);
     }
 
+    // Join super_admins room if user is a platform super admin
+    if (socket.user.role === 'super_admin') {
+      socket.join('super_admins');
+      console.log(`[Socket] Super Admin ${socket.user.name} joined room: super_admins`);
+    }
+
     User.updateOne({ _id: userId }, { $set: { lastSeenAt: null } }).catch((error) => {
       console.error('Presence update error:', error.message);
     });

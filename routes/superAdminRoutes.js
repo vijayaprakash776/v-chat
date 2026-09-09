@@ -35,4 +35,9 @@ router.patch('/organizations/:id/subscription', updateSubscription);
 // Feature entitlement management
 router.patch('/organizations/:id/features', updateFeatures);
 
+// User management
+const { getAllUsers, updatePlatformUser } = require('../controllers/superAdminController');
+router.get('/users', getAllUsers);
+router.patch('/users/:id', updatePlatformUser);
+
 module.exports = router;
