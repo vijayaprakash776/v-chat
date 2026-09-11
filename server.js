@@ -79,6 +79,7 @@ app.use('/api/reminders', require('./routes/reminderRoutes'));
 app.use('/api/notes', require('./routes/noteRoutes'));
 app.use('/api/super-admin', require('./routes/superAdminRoutes'));
 app.use('/api/invitations', require('./routes/invitationRoutes'));
+app.use('/api/google', require('./routes/googleCalendarRoutes'));
 
 // Configure Port
 const PORT = process.env.PORT || 5000;
